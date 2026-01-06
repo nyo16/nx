@@ -635,6 +635,96 @@ defmodule EXLA.MLIR.Value do
     op(func, "stablehlo.reduce", operands, result_types, attributes: attributes, regions: regions)
   end
 
+  @doc """
+  Performs an all-reduce collective operation across replicas.
+
+  The all-reduce operation reduces tensors across all replicas in each group
+  and returns the result on all replicas. This is essential for tensor parallelism
+  where partial results need to be summed across GPUs.
+
+  ## Arguments
+
+    * `operand` - The input tensor to reduce
+    * `reduction_op` - The reduction operation (`:sum`, `:max`, `:min`, `:product`)
+    * `replica_groups` - List of replica groups, e.g., `[[0, 1]]` means replicas 0 and 1 form one group
+    * `typespec` - The typespec of the result (same as input)
+    * `opts` - Options:
+      * `:channel_id` - Optional channel ID for cross-replica communication (default: nil)
+      * `:use_global_device_ids` - Whether to use global device IDs (default: false)
+
+  ## Example
+
+      # Sum tensors across 2 GPUs
+      all_reduce(tensor, :sum, [[0, 1]], typespec)
+  """
+  def all_reduce(%Value{function: func} = operand, reduction_op, replica_groups, typespec, opts \\ [])
+      when reduction_op in [:sum, :max, :min, :product] do
+    result_types = typespecs_to_mlir_types([typespec])
+
+    # Build reduction computation region
+    reduction = all_reduce_computation(func, reduction_op, typespec)
+
+    # Build attributes
+    channel_id = Keyword.get(opts, :channel_id)
+    use_global_device_ids = Keyword.get(opts, :use_global_device_ids, false)
+
+    # replica_groups is a 2D tensor: dense<[[0, 1], [2, 3]]> : tensor<2x2xi64>
+    num_groups = length(replica_groups)
+    group_size = if num_groups > 0, do: length(hd(replica_groups)), else: 0
+    flat_groups = List.flatten(replica_groups)
+
+    attributes = [
+      replica_groups: attr_dense_elements(flat_groups, {:s, 64}, {num_groups, group_size})
+    ]
+
+    # Add optional channel_handle attribute
+    attributes =
+      if channel_id do
+        [{:channel_handle, attr_channel_handle(channel_id)} | attributes]
+      else
+        attributes
+      end
+
+    # Add use_global_device_ids if true
+    attributes =
+      if use_global_device_ids do
+        [{:use_global_device_ids, "unit"} | attributes]
+      else
+        attributes
+      end
+
+    op(func, "stablehlo.all_reduce", [operand], result_types,
+      attributes: attributes,
+      regions: [reduction.ref]
+    )
+    |> one!()
+  end
+
+  # Builds the reduction computation region for all_reduce
+  defp all_reduce_computation(%Function{} = function, reduction_op, typespec) do
+    # The reduction takes two scalar arguments and returns one scalar
+    arg_typespec = Typespec.to_shape(typespec, {})
+    {region, [lhs, rhs]} = Function.push_region(function, [arg_typespec, arg_typespec])
+
+    res =
+      case reduction_op do
+        :sum -> add(lhs, rhs, arg_typespec)
+        :max -> max(lhs, rhs, arg_typespec)
+        :min -> min(lhs, rhs, arg_typespec)
+        :product -> multiply(lhs, rhs, arg_typespec)
+      end
+
+    return(function, [res])
+    Function.pop_region(function)
+    region
+  end
+
+  # Formats channel_handle attribute for collective operations
+  # type=1 means DEVICE_TO_DEVICE communication
+  defp attr_channel_handle(channel_id, type \\ 1) do
+    "#stablehlo.channel_handle<handle = #{channel_id}, type = #{type}>"
+  end
+
   def window_reduce(
         %Region{ref: reducer},
         [%Value{function: func} | _] = init_values,
