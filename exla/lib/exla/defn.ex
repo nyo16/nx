@@ -551,6 +551,22 @@ defmodule EXLA.Defn do
     {fft2(&Value.fft(&1, :ifft, &2, &3), [tensor, opts], expr, state), cache}
   end
 
+  # All-reduce for tensor parallelism - intercept and emit MLIR all_reduce op
+  defp cached_recur_operator(
+         :optional,
+         %T{data: %Expr{args: [%{data: %{op: :all_reduce, args: [tensor, opts]}}, expr, _callback]}},
+         state,
+         cache
+       ) do
+    {tensor, cache} = recur_operator(tensor, state, cache) |> unwrap_single_tensor!()
+
+    reduction_op = Keyword.get(opts, :op, :sum)
+    replica_groups = Keyword.get(opts, :replica_groups, [[0, 1]])
+
+    result = Value.all_reduce(tensor, reduction_op, replica_groups, expr_to_typespec(expr))
+    {result, cache}
+  end
+
   defp cached_recur_operator(:optional, %T{data: %Expr{args: args}}, state, cache) do
     [call, expr, _callback] = args
     %{data: %{args: in_args, op: op}} = call
